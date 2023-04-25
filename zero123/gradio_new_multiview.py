@@ -11,18 +11,20 @@ import gradio as gr
 import lovely_numpy
 import lovely_tensors
 import numpy as np
+import os
 import plotly.express as px
 import plotly.graph_objects as go
+import psutil
 import rich
 import sys
 import time
 import torch
 from contextlib import nullcontext
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
-from einops import rearrange
+from einops import rearrange, repeat
 from functools import partial
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.util import create_carvekit_interface, load_and_preprocess, instantiate_from_config
+from ldm_zero123.models.diffusion.ddim import DDIMSampler
+from ldm_zero123.util import create_carvekit_interface, load_and_preprocess, instantiate_from_config
 from lovely_numpy import lo
 from omegaconf import OmegaConf
 from PIL import Image
@@ -30,9 +32,11 @@ from rich import print
 from transformers import AutoFeatureExtractor #, CLIPImageProcessor
 from torch import autocast
 from torchvision import transforms
+from tqdm import tqdm
 
-from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, extract_into_tensor
-from ldm.models.diffusion.sampling_util import renorm_thresholding, norm_thresholding, spatial_norm_thresholding
+from ldm_zero123.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, extract_into_tensor
+from ldm_zero123.models.diffusion.sampling_util import renorm_thresholding, norm_thresholding, spatial_norm_thresholding
+from ldm.models.diffusion.ddpm import SizeAndCropConditionedTxt2ImgDiffusionWithPooledInput  # for 2.2
 
 
 _SHOW_DESC = True
@@ -54,6 +58,48 @@ Note that this model is not intended for images of humans or faces, and is unlik
 _ARTICLE = 'See uses.md'
 
 
+def get_CPU_mem():
+    return psutil.Process(os.getpid()).memory_info().rss /1024**3
+
+
+def get_GPU_mem():
+    try:
+        num = torch.cuda.device_count()
+        mem, mems = 0, []
+        for i in range(num):
+            mem_free, mem_total = torch.cuda.mem_get_info(i)
+            mems.append(int(((mem_total - mem_free)/1024**3)*1000)/1000)
+            mem += mems[-1]
+        return mem, mems
+    except:
+        try:
+            def get_gpu_memory_map():
+                import subprocess
+                """Get the current gpu usage.
+
+                Returns
+                -------
+                usage: dict
+                    Keys are device ids as integers.
+                    Values are memory usage as integers in MB.
+                """
+                result = subprocess.check_output(
+                    [
+                        'nvidia-smi', '--query-gpu=memory.used',
+                        '--format=csv,nounits,noheader'
+                    ], encoding='utf-8')
+                # Convert lines into a dictionary
+                gpu_memory = [int(x) for x in result.strip().split('\n')]
+                gpu_memory_map = dict(zip(range(len(gpu_memory)), gpu_memory))
+                return gpu_memory_map
+            mems = get_gpu_memory_map()
+            mems = [int(mems[k]/1024*1000)/1000 for k in mems]
+            mem = int(sum([m for m in mems])*1000)/1000
+            return mem, mems
+        except:
+            return 0, "CPU"
+
+
 def load_model_from_config(config, ckpt, device, verbose=False):
     print(f'Loading model from {ckpt}')
     pl_sd = torch.load(ckpt, map_location='cpu')
@@ -72,230 +118,6 @@ def load_model_from_config(config, ckpt, device, verbose=False):
     model.to(device)
     model.eval()
     return model
-
-
-@torch.no_grad()
-def sample_model(input_im, model, sampler, precision, h, w, ddim_steps, n_samples, scale,
-                 ddim_eta, x, y, z):
-    precision_scope = autocast if precision == 'autocast' else nullcontext
-    with precision_scope('cuda'):
-        with model.ema_scope():
-            c = model.get_learned_conditioning(input_im).tile(n_samples, 1, 1)
-            T = torch.tensor([math.radians(x), math.sin(
-                math.radians(y)), math.cos(math.radians(y)), z])
-            T = T[None, None, :].repeat(n_samples, 1, 1).to(c.device)
-            c = torch.cat([c, T], dim=-1)
-            c = model.cc_projection(c)
-            cond = {}
-            cond['c_crossattn'] = [c]
-            c_concat = model.encode_first_stage((input_im.to(c.device))).mode().detach()
-            cond['c_concat'] = [model.encode_first_stage((input_im.to(c.device))).mode().detach()
-                                .repeat(n_samples, 1, 1, 1)]
-            if scale != 1.0:
-                uc = {}
-                uc['c_concat'] = [torch.zeros(n_samples, 4, h // 8, w // 8).to(c.device)]
-                uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
-            else:
-                uc = None
-
-            shape = [4, h // 8, w // 8]
-            samples_ddim, _ = sampler.sample(S=ddim_steps,
-                                             conditioning=cond,
-                                             batch_size=n_samples,
-                                             shape=shape,
-                                             verbose=False,
-                                             unconditional_guidance_scale=scale,
-                                             unconditional_conditioning=uc,
-                                             eta=ddim_eta,
-                                             x_T=None)
-            print(samples_ddim.shape)
-            # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
-            x_samples_ddim = model.decode_first_stage(samples_ddim)
-            return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
-
-
-class DDIMSamplerMultiview(DDIMSampler):
-
-    @torch.no_grad()
-    def sample(self,
-               S,
-               batch_size,
-               shape,
-               conditioning=None,
-               callback=None,
-               normals_sequence=None,
-               img_callback=None,
-               quantize_x0=False,
-               eta=0.,
-               mask=None,
-               x0=None,
-               temperature=1.,
-               noise_dropout=0.,
-               score_corrector=None,
-               corrector_kwargs=None,
-               verbose=True,
-               x_T=None,
-               log_every_t=100,
-               unconditional_guidance_scale=1.,
-               unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
-               dynamic_threshold=None,
-               **kwargs
-               ):
-        if conditioning is not None:
-            if isinstance(conditioning, dict):
-                ctmp = conditioning[list(conditioning.keys())[0]]
-                while isinstance(ctmp, list): ctmp = ctmp[0]
-                cbs = ctmp.shape[0]
-                if cbs != batch_size:
-                    print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
-
-            elif isinstance(conditioning, list):
-                if isinstance(conditioning[0], dict):
-                    ctmp = conditioning[0][list(conditioning[0].keys())[0]]
-                    while isinstance(ctmp, list): ctmp = ctmp[0]
-                    cbs = ctmp.shape[0]
-                    if cbs != batch_size:
-                        print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
-                else:
-                    if conditioning[0].shape[0] != batch_size:
-                        print(f"Warning: Got {conditioning[0].shape[0]} conditionings but batch-size is {batch_size}")
-
-            else:
-                if conditioning.shape[0] != batch_size:
-                    print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
-
-        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
-        # sampling
-        C, H, W = shape
-        size = (batch_size, C, H, W)
-        print(f'Data shape for DDIM sampling is {size}, eta {eta}')
-
-        samples, intermediates = self.ddim_sampling(conditioning, size,
-                                                    callback=callback,
-                                                    img_callback=img_callback,
-                                                    quantize_denoised=quantize_x0,
-                                                    mask=mask, x0=x0,
-                                                    ddim_use_original_steps=False,
-                                                    noise_dropout=noise_dropout,
-                                                    temperature=temperature,
-                                                    score_corrector=score_corrector,
-                                                    corrector_kwargs=corrector_kwargs,
-                                                    x_T=x_T,
-                                                    log_every_t=log_every_t,
-                                                    unconditional_guidance_scale=unconditional_guidance_scale,
-                                                    unconditional_conditioning=unconditional_conditioning,
-                                                    dynamic_threshold=dynamic_threshold,
-                                                    )
-        return samples, intermediates
-
-    @torch.no_grad()
-    def p_sample_ddim(self, x, cs, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      dynamic_threshold=None):
-        b, *_, device = *x.shape, x.device
-
-        e_ts = []
-        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            for c in cs:
-                e_t = self.model.apply_model(x, t, c)
-                e_ts.append(e_t)
-        else:
-            x_in = torch.cat([x] * 2)
-            t_in = torch.cat([t] * 2)
-            for c in cs:
-                if isinstance(c, dict):
-                    assert isinstance(unconditional_conditioning, dict)
-                    c_in = dict()
-                    for k in c:
-                        if isinstance(c[k], list):
-                            c_in[k] = [torch.cat([
-                                unconditional_conditioning[k][i],
-                                c[k][i]]) for i in range(len(c[k]))]
-                        else:
-                            c_in[k] = torch.cat([
-                                    unconditional_conditioning[k],
-                                    c[k]])
-                else:
-                    c_in = torch.cat([unconditional_conditioning, c])
-                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
-                e_ts.append(e_t)
-        e_t = torch.stack(e_ts).mean(dim=0)
-
-        if score_corrector is not None:
-            assert self.model.parameterization == "eps"
-            e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
-
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-        # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-
-        # current prediction for x_0
-        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-        if quantize_denoised:
-            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
-
-        if dynamic_threshold is not None:
-            pred_x0 = norm_thresholding(pred_x0, dynamic_threshold)
-
-        # direction pointing to x_t
-        dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-        noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-        if noise_dropout > 0.:
-            noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-        x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        return x_prev, pred_x0
-
-
-@torch.no_grad()
-def sample_model_multiview(input_imgs, model, sampler, precision, h, w, ddim_steps, n_samples, scale,
-                 ddim_eta, xs, ys, zs):
-    precision_scope = autocast if precision == 'autocast' else nullcontext
-    with precision_scope('cuda'):
-        with model.ema_scope():
-            conds = []
-            for (input_im, x, y, z) in zip(input_imgs, xs, ys, zs):
-                c = model.get_learned_conditioning(input_im).tile(n_samples, 1, 1)
-                T = torch.tensor([math.radians(x), math.sin(
-                    math.radians(y)), math.cos(math.radians(y)), z])
-                T = T[None, None, :].repeat(n_samples, 1, 1).to(c.device)
-                c = torch.cat([c, T], dim=-1)
-                c = model.cc_projection(c)
-                cond = {}
-                cond['c_crossattn'] = [c]
-                cond['c_concat'] = [model.encode_first_stage((input_im.to(c.device))).mode().detach()
-                                    .repeat(n_samples, 1, 1, 1)]
-                conds.append(cond)
-
-            if scale != 1.0:
-                uc = {}
-                uc['c_concat'] = [torch.zeros(n_samples, 4, h // 8, w // 8).to(c.device)]
-                uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
-            else:
-                uc = None
-
-            shape = [4, h // 8, w // 8]
-            samples_ddim, _ = sampler.sample(S=ddim_steps,
-                                            conditioning=conds,
-                                            batch_size=n_samples,
-                                            shape=shape,
-                                            verbose=False,
-                                            unconditional_guidance_scale=scale,
-                                            unconditional_conditioning=uc,
-                                            eta=ddim_eta,
-                                            x_T=None)
-            print(samples_ddim.shape)
-            # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
-            x_samples_ddim = model.decode_first_stage(samples_ddim)
-            return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
-
 
 
 class CameraVisualizer:
@@ -405,7 +227,7 @@ class CameraVisualizer:
 
                 input_cone2 = calc_cam_cone_pts_3d(
                     np.rad2deg(theta), np.rad2deg(phi), base_radius + self._radius * (zoom_scale + scale), fov_deg)  # (5, 3).
-                cones.append((input_cone2, 'green', 'Input view 2'))
+                cones.append((input_cone2, 'red', 'Input view 2'))
 
             for (cone, clr, legend) in cones:
 
@@ -526,6 +348,397 @@ def preprocess_image(models, input_im, preprocess):
     return input_im
 
 
+class DDIMSamplerMultiview(DDIMSampler):
+
+    def __init__(self, model, model_text=None, schedule="linear", **kwargs):
+        super().__init__(model, schedule, **kwargs)
+        self.model_text = model_text
+
+    @torch.no_grad()
+    def sample(self,
+               S,
+               batch_size,
+               shape,
+               conditioning=None,
+               cond_weights=None,
+               callback=None,
+               normals_sequence=None,
+               img_callback=None,
+               quantize_x0=False,
+               eta=0.,
+               mask=None,
+               x0=None,
+               temperature=1.,
+               noise_dropout=0.,
+               score_corrector=None,
+               corrector_kwargs=None,
+               verbose=True,
+               x_T=None,
+               log_every_t=100,
+               unconditional_guidance_scale=1.,
+               unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
+               dynamic_threshold=None,
+               multiview_steps=50,
+               text_c=None,
+               text_uc=None,
+               text_guidance_scale=9.0,
+               text_weight=1.0,
+               text_steps=0,
+               **kwargs
+               ):
+        if conditioning is not None:
+            if isinstance(conditioning, dict):
+                ctmp = conditioning[list(conditioning.keys())[0]]
+                while isinstance(ctmp, list): ctmp = ctmp[0]
+                cbs = ctmp.shape[0]
+                if cbs != batch_size:
+                    print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
+
+            elif isinstance(conditioning, list):
+                if isinstance(conditioning[0], dict):
+                    ctmp = conditioning[0][list(conditioning[0].keys())[0]]
+                    while isinstance(ctmp, list): ctmp = ctmp[0]
+                    cbs = ctmp.shape[0]
+                    if cbs != batch_size:
+                        print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
+                else:
+                    if conditioning[0].shape[0] != batch_size:
+                        print(f"Warning: Got {conditioning[0].shape[0]} conditionings but batch-size is {batch_size}")
+
+            else:
+                if conditioning.shape[0] != batch_size:
+                    print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
+
+        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
+        # sampling
+        C, H, W = shape
+        size = (batch_size, C, H, W)
+        print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+
+        if text_c is not None:
+            assert self.model_text is not None, "Add a text model!"
+
+        samples, intermediates = self.ddim_sampling(conditioning, cond_weights, size,
+                                                    callback=callback,
+                                                    img_callback=img_callback,
+                                                    quantize_denoised=quantize_x0,
+                                                    mask=mask, x0=x0,
+                                                    ddim_use_original_steps=False,
+                                                    noise_dropout=noise_dropout,
+                                                    temperature=temperature,
+                                                    score_corrector=score_corrector,
+                                                    corrector_kwargs=corrector_kwargs,
+                                                    x_T=x_T,
+                                                    log_every_t=log_every_t,
+                                                    unconditional_guidance_scale=unconditional_guidance_scale,
+                                                    unconditional_conditioning=unconditional_conditioning,
+                                                    dynamic_threshold=dynamic_threshold,
+                                                    multiview_steps=multiview_steps,
+                                                    text_c=text_c,
+                                                    text_uc=text_uc,
+                                                    text_guidance_scale=text_guidance_scale,
+                                                    text_weight=text_weight,
+                                                    text_steps=text_steps,
+                                                    )
+        return samples, intermediates
+
+    @torch.no_grad()
+    def ddim_sampling(self, cond, cond_weights, shape,
+                      x_T=None, ddim_use_original_steps=False, multiview_steps=None,
+                      callback=None, timesteps=None, quantize_denoised=False,
+                      mask=None, x0=None, img_callback=None, log_every_t=100,
+                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
+                      t_start=-1, text_c=None, text_uc=None, text_guidance_scale=9.0, text_weight=1.0, text_steps=0):
+        device = self.model.betas.device
+        b = shape[0]
+        if x_T is None:
+            img = torch.randn(shape, device=device)
+        else:
+            img = x_T
+
+        if timesteps is None:
+            timesteps = self.ddpm_num_timesteps if ddim_use_original_steps else self.ddim_timesteps
+        elif timesteps is not None and not ddim_use_original_steps:
+            subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
+            timesteps = self.ddim_timesteps[:subset_end]
+
+        timesteps = timesteps[:t_start]
+
+        intermediates = {'x_inter': [img], 'pred_x0': [img]}
+        time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
+        total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
+        print(f"Running DDIM Sampling with {total_steps} timesteps")
+
+        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+
+        for i, step in enumerate(iterator):
+            index = total_steps - i - 1
+            ts = torch.full((b,), step, device=device, dtype=torch.long)
+
+            if mask is not None:
+                assert x0 is not None
+                img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
+                img = img_orig * mask + (1. - mask) * img
+
+            outs = self.p_sample_ddim(img, cond if index < multiview_steps else [cond[0]],
+                                      cond_weights if index < multiview_steps else [cond_weights[0]],
+                                      ts, index=index, use_original_steps=ddim_use_original_steps,
+                                      quantize_denoised=quantize_denoised, temperature=temperature,
+                                      noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                      corrector_kwargs=corrector_kwargs,
+                                      unconditional_guidance_scale=unconditional_guidance_scale,
+                                      unconditional_conditioning=unconditional_conditioning,
+                                      dynamic_threshold=dynamic_threshold,
+                                      text_c=text_c if index < text_steps else None,
+                                      text_uc=text_uc if index < text_steps else None,
+                                      text_guidance_scale=text_guidance_scale,
+                                      text_weight=text_weight)
+            print(f"{get_GPU_mem()[0]:.03f}GB, {get_CPU_mem():.03f}GB")
+            img, pred_x0 = outs
+            if callback:
+                img = callback(i, img, pred_x0)
+            if img_callback: img_callback(pred_x0, i)
+
+            if index % log_every_t == 0 or index == total_steps - 1:
+                intermediates['x_inter'].append(img)
+                intermediates['pred_x0'].append(pred_x0)
+
+        return img, intermediates
+
+    @torch.no_grad()
+    def p_sample_ddim(self, x, cs, cws, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
+                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      dynamic_threshold=None, text_c=None, text_uc=None, text_guidance_scale=9.0, text_weight=1.0):
+        b, *_, device = *x.shape, x.device
+
+        e_ts = []
+        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+            for c in cs:
+                e_t = self.model.apply_model(x, t, c)
+                e_ts.append(e_t)
+        else:
+            x_in = torch.cat([x] * 2)
+            t_in = torch.cat([t] * 2)
+            for c, cw in zip(cs, cws):
+                if isinstance(c, dict):
+                    assert isinstance(unconditional_conditioning, dict)
+                    c_in = dict()
+                    for k in c:
+                        if isinstance(c[k], list):
+                            c_in[k] = [torch.cat([
+                                unconditional_conditioning[k][i],
+                                c[k][i]]) for i in range(len(c[k]))]
+                        else:
+                            c_in[k] = torch.cat([
+                                    unconditional_conditioning[k],
+                                    c[k]])
+                else:
+                    c_in = torch.cat([unconditional_conditioning, c])
+                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+                e_ts.append(cw * e_t)
+
+        if text_c is not None:
+            with self.model_text.ema_scope():
+                if text_uc is None or text_guidance_scale == 1.:
+                    e_t = self.model_text.apply_model(x, t, text_c)
+                else:
+                    if isinstance(text_c, dict):
+                        assert isinstance(text_uc, dict)
+                        c_in = dict()
+                        for k in text_c:
+                            if isinstance(text_c[k], list):
+                                c_in[k] = [torch.cat([
+                                    text_uc[k][i],
+                                    text_c[k][i]]) for i in range(len(text_c[k]))]
+                            else:
+                                c_in[k] = torch.cat([
+                                        text_uc[k],
+                                        text_c[k]])
+                    elif isinstance(text_c, list):
+                        c_in = list()
+                        assert isinstance(text_uc, list)
+                        for i in range(len(text_c)):
+                            c_in.append(torch.cat([text_uc[i], text_c[i]]))
+                    else:
+                        c_in = torch.cat([text_uc, text_c])
+                    e_t_uncond, e_t = self.model_text.apply_model(x_in, t_in, c_in).chunk(2)
+                    e_t = e_t_uncond + text_guidance_scale * (e_t - e_t_uncond)
+                e_ts.append(text_weight * e_t)
+
+        e_t = torch.stack(e_ts).sum(dim=0)/(sum(cws) + (text_weight if text_c is not None else 0))
+
+        if score_corrector is not None:
+            assert self.model.parameterization == "eps"
+            e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
+
+        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
+        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
+        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
+        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
+        # select parameters corresponding to the currently considered timestep
+        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
+        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
+        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+
+        # current prediction for x_0
+        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+        if quantize_denoised:
+            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
+
+        if dynamic_threshold is not None:
+            pred_x0 = norm_thresholding(pred_x0, dynamic_threshold)
+
+        # direction pointing to x_t
+        dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
+        noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
+        if noise_dropout > 0.:
+            noise = torch.nn.functional.dropout(noise, p=noise_dropout)
+        x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        return x_prev, pred_x0
+
+
+@torch.no_grad()
+def sample_model(input_im, model, sampler, precision, h, w, ddim_steps, n_samples, scale,
+                 ddim_eta, x, y, z):
+    precision_scope = autocast if precision == 'autocast' else nullcontext
+    with precision_scope('cuda'):
+        with model.ema_scope():
+            c = model.get_learned_conditioning(input_im).tile(n_samples, 1, 1)
+            T = torch.tensor([math.radians(x), math.sin(
+                math.radians(y)), math.cos(math.radians(y)), z])
+            T = T[None, None, :].repeat(n_samples, 1, 1).to(c.device)
+            c = torch.cat([c, T], dim=-1)
+            c = model.cc_projection(c)
+            cond = {}
+            cond['c_crossattn'] = [c]
+            c_concat = model.encode_first_stage((input_im.to(c.device))).mode().detach()
+            cond['c_concat'] = [model.encode_first_stage((input_im.to(c.device))).mode().detach()
+                                .repeat(n_samples, 1, 1, 1)]
+            if scale != 1.0:
+                uc = {}
+                uc['c_concat'] = [torch.zeros(n_samples, 4, h // 8, w // 8).to(c.device)]
+                uc['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
+            else:
+                uc = None
+
+            shape = [4, h // 8, w // 8]
+            samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                             conditioning=cond,
+                                             batch_size=n_samples,
+                                             shape=shape,
+                                             verbose=False,
+                                             unconditional_guidance_scale=scale,
+                                             unconditional_conditioning=uc,
+                                             eta=ddim_eta,
+                                             x_T=None)
+            print(samples_ddim.shape)
+            # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
+            x_samples_ddim = model.decode_first_stage(samples_ddim)
+            return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
+
+
+@torch.no_grad()
+def sample_model_multiview(input_imgs, model, model_text, sampler, precision, h, w, ddim_steps, n_samples, scale,
+                 ddim_eta, xs, ys, zs, cond_weights, multiview_steps=None,
+                 text=None, text_guidance_scale=9.0, text_weight=1.0, text_steps=0):
+    if multiview_steps is None:
+        multiview_steps = ddim_steps
+    precision_scope = autocast if precision == 'autocast' else nullcontext
+    with precision_scope('cuda'):
+        with model.ema_scope():
+            conds = []
+            for (input_im, x, y, z) in zip(input_imgs, xs, ys, zs):
+                c = model.get_learned_conditioning(input_im).tile(n_samples, 1, 1)
+                T = torch.tensor([math.radians(x), math.sin(
+                    math.radians(y)), math.cos(math.radians(y)), z])
+                T = T[None, None, :].repeat(n_samples, 1, 1).to(c.device)
+                c = torch.cat([c, T], dim=-1)
+                c = model.cc_projection(c)
+                cond = {}
+                cond['c_crossattn'] = [c]
+                cond['c_concat'] = [model.encode_first_stage((input_im.to(c.device))).mode().detach()
+                                    .repeat(n_samples, 1, 1, 1)]
+                conds.append(cond)
+
+            if scale != 1.0:
+                unconditional_conditioning = {}
+                unconditional_conditioning['c_concat'] = [torch.zeros(n_samples, 4, h // 8, w // 8).to(c.device)]
+                unconditional_conditioning['c_crossattn'] = [torch.zeros_like(c).to(c.device)]
+            else:
+                unconditional_conditioning = None
+
+    # Text conditioning
+    text_c, text_uc = {}, {}
+    if text is not None and text_steps > 0:
+        vector_cond, vector_uc = None, None
+        if isinstance(model_text, SizeAndCropConditionedTxt2ImgDiffusionWithPooledInput):
+            # TODO: this fixes the conditioning augmentation values to full res and no cropping. Could be played with.
+            with torch.no_grad():
+                # size conditioning
+                vec_cond_size = torch.Tensor([[h, w]]).to(model_text.device)
+                vec_uc_size = torch.Tensor([[h, w]]).to(model_text.device)
+                vec_cond_size = model_text.size_embedder(vec_cond_size)
+                vec_uc_size = model_text.size_embedder(vec_uc_size)
+
+                # crop conditioning
+                vec_cond_crop = torch.Tensor([[0, 0]]).to(model_text.device)
+                vec_uc_crop = torch.Tensor([[0, 0]]).to(model_text.device)
+                vec_cond_crop = model_text.crop_embedder(vec_cond_crop)
+                vec_uc_crop = model_text.crop_embedder(vec_uc_crop)
+
+                vector_cond = torch.cat((vec_cond_size, vec_cond_crop), 1)
+                vector_uc = torch.cat((vec_uc_size, vec_uc_crop), 1)
+
+        with torch.no_grad(), \
+                precision_scope("cuda"), \
+                model_text.ema_scope():
+            prompts = text
+            uc = None
+            if text_guidance_scale != 1.0:
+                uc = model_text.get_learned_conditioning(n_samples * [""])
+            if isinstance(prompts, tuple):
+                prompts = list(prompts)
+            c = model_text.get_learned_conditioning(n_samples * [prompts])
+
+            if isinstance(model_text, SizeAndCropConditionedTxt2ImgDiffusionWithPooledInput):
+                c_vec0, uc_vec0 = c[1][model_text.extra_key], uc[1][model_text.extra_key]
+                c, uc = c[0], uc[0]
+                if vector_cond.shape[0] == 1:
+                    vector_cond = repeat(vector_cond, '1 ... -> b ...', b=n_samples)
+                    vector_uc = repeat(vector_uc, '1 ... -> b ...', b=n_samples)
+                    vector_cond, vector_uc = torch.cat((c_vec0, vector_cond), 1), torch.cat((uc_vec0, vector_uc), 1)
+                text_c = {"c_crossattn": [c], "c_adm": vector_cond}
+                text_uc = {"c_crossattn": [uc], "c_adm": vector_uc}
+
+    with precision_scope('cuda'):
+        with model.ema_scope():
+            shape = [4, h // 8, w // 8]
+            samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                            conditioning=conds,
+                                            cond_weights=cond_weights,
+                                            batch_size=n_samples,
+                                            shape=shape,
+                                            verbose=False,
+                                            unconditional_guidance_scale=scale,
+                                            unconditional_conditioning=unconditional_conditioning,
+                                            eta=ddim_eta,
+                                            x_T=None,
+                                            multiview_steps=multiview_steps,
+                                            text_c=text_c,
+                                            text_uc=text_uc,
+                                            text_guidance_scale=text_guidance_scale,
+                                            text_weight=text_weight,
+                                            text_steps=text_steps)
+            print(samples_ddim.shape)
+            # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
+            x_samples_ddim = model.decode_first_stage(samples_ddim)
+            return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
+
+
 def main_run(models, device, cam_vis, return_what,
              x=0.0, y=0.0, z=0.0,
              raw_im=None, preprocess=True,
@@ -619,14 +832,19 @@ def main_run(models, device, cam_vis, return_what,
 
 def main_run_multiview(models, device, cam_vis2, return_what,
             x=0.0, y=0.0, z=0.0,
-            raw_im=None, preprocess=True,
+            raw_im=None, preprocess=True, cond_weight=1.0,
             x2=0.0, y2=0.0, z2=0.0,
-            raw_im2=None, preprocess2=True,
-            scale=3.0, n_samples=4, ddim_steps=50, ddim_eta=1.0,
-            precision='fp32', h=256, w=256):
+            raw_im2=None, preprocess2=True, cond_weight2=1.0, multiview_steps=None,
+            scale=3.0, n_samples=4, ddim_steps=50,
+            text=None, text_guidance_scale=9.0, text_weight=1.0, text_steps=0,
+            ddim_eta=1.0, precision='fp32', h=256, w=256):
     '''
     :param raw_im (PIL Image).
     '''
+
+    if text is not None:
+        print("TEXT:")
+        print(text)
 
     print("Process Image 1")
     raw_im.thumbnail([1536, 1536], Image.Resampling.LANCZOS)
@@ -705,7 +923,7 @@ def main_run_multiview(models, device, cam_vis2, return_what,
     cam_vis2.azimuth_change(y)
     cam_vis2.radius_change(z)
     cam_vis2.encode_image(show_in_im1)
-    new_fig2 = cam_vis2.update_figure((input_im2 * 255.0).astype(np.uint8), x2, y2, z2)
+    new_fig2 = cam_vis2.update_figure(show_in_im12, x2, y2, z2)
 
 
     if 'vis' in return_what:
@@ -736,11 +954,13 @@ def main_run_multiview(models, device, cam_vis2, return_what,
     input_im2 = transforms.functional.resize(input_im2, [h, w])
 
     print("Generate")
-    sampler = DDIMSamplerMultiview(models['turncam'])
+    # sampler = DDIMSampler(models['turncam'])
+    sampler_multiview = DDIMSamplerMultiview(models['turncam'], models['sd'])
     # used_x = -x  # NOTE: Polar makes more sense in Basile's opinion this way!
     used_x = [x, x-x2]  # NOTE: Set this way for consistency.
-    x_samples_ddim = sample_model_multiview([input_im, input_im2], models['turncam'], sampler, precision, h, w,
-                                            ddim_steps, n_samples, scale, ddim_eta, used_x, [y, y-y2], [z, z-z2])
+    x_samples_ddim = sample_model_multiview([input_im, input_im2], models['turncam'], models['sd'], sampler_multiview, precision, h, w,
+                                            ddim_steps, n_samples, scale, ddim_eta, used_x, [y, y-y2], [z, z-z2], [cond_weight, cond_weight2],
+                                            multiview_steps, text, text_guidance_scale, text_weight, text_steps)
 
     output_ims = []
     for x_sample in x_samples_ddim:
@@ -823,8 +1043,12 @@ def calc_cam_cone_pts_3d(polar_deg, azimuth_deg, radius_m, fov_deg):
 
 def run_demo(
         device_idx=_GPU_INDEX,
+        text_device_idx=_GPU_INDEX,
         ckpt='105000.ckpt',
-        config='configs/sd-objaverse-finetune-c_concat-256.yaml'):
+        config='configs/sd-objaverse-finetune-c_concat-256.yaml',
+        ckpt_sd='/admin/home-vikram/git/stable-diffusion-staging/checkpoints/v2-2_alpha.ckpt',
+        config_sd='/admin/home-vikram/git/stable-diffusion-staging/configs/stable-diffusion/v2-2_alpha.yaml',
+        ):
 
     print('sys.argv:', sys.argv)
     if len(sys.argv) > 1:
@@ -834,11 +1058,14 @@ def run_demo(
 
     device = f'cuda:{device_idx}'
     config = OmegaConf.load(config)
+    config_sd = OmegaConf.load(config_sd)
 
     # Instantiate all models beforehand for efficiency.
     models = dict()
-    print('Instantiating LatentDiffusion...')
+    print('Instantiating Zero123 LatentDiffusion...')
     models['turncam'] = load_model_from_config(config, ckpt, device=device)
+    print('Instantiating SD LatentDiffusion...')
+    models['sd'] = load_model_from_config(config_sd, ckpt_sd, device=text_device_idx)
     print('Instantiating Carvekit HiInterface...')
     models['carvekit'] = create_carvekit_interface()
     print('Instantiating StableDiffusionSafetyChecker...')
@@ -897,17 +1124,17 @@ def run_demo(
                     -180, 180, value=0, step=5, label='Azimuth angle (horizontal rotation in degrees)')
                 # info='Positive values move the camera right, while negative values move the camera left.')
                 radius_slider = gr.Slider(
-                    -0.5, 0.5, value=0.0, step=0.1, label='Zoom (relative distance from center)')
+                    -0.5, 0.5, value=0.0, step=0.05, label='Zoom (relative distance from center)')
                 # info='Positive values move the camera further away, while negative values move the camera closer.')
 
                 samples_slider = gr.Slider(1, 8, value=4, step=1,
                                            label='Number of samples to generate')
 
-                with gr.Accordion('Advanced options', open=False):
-                    scale_slider = gr.Slider(0, 30, value=3, step=1,
-                                             label='Diffusion guidance scale')
-                    steps_slider = gr.Slider(5, 200, value=75, step=5,
-                                             label='Number of diffusion inference steps')
+                # with gr.Accordion('Advanced options', open=False):
+                scale_slider = gr.Slider(0, 30, value=3, step=1,
+                                            label='Diffusion guidance scale')
+                steps_slider = gr.Slider(5, 200, value=75, step=5,
+                                            label='Number of diffusion inference steps')
 
                 with gr.Row():
                     vis_btn = gr.Button('Visualize Angles', variant='secondary')
@@ -926,6 +1153,8 @@ def run_demo(
                 preproc_output = gr.Image(type='pil', image_mode='RGB',
                                           label='Preprocessed input image', visible=_SHOW_INTERMEDIATE)
 
+        # MULTIVIEW
+        gr.Markdown("# MULTIVIEW")
         with gr.Row():
             with gr.Column(scale=0.9, variant='panel'):
 
@@ -954,7 +1183,7 @@ def run_demo(
                     -180, 180, value=0, step=5, label='Azimuth angle (horizontal rotation in degrees)')
                 # info='Positive values move the camera right, while negative values move the camera left.')
                 radius_slider2 = gr.Slider(
-                    -0.5, 0.5, value=0.0, step=0.1, label='Zoom (relative distance from center)')
+                    -0.5, 0.5, value=0.0, step=0.05, label='Zoom (relative distance from center)')
                 # info='Positive values move the camera further away, while negative values move the camera closer.')
 
                 # samples_slider2 = gr.Slider(1, 8, value=4, step=1,
@@ -965,6 +1194,14 @@ def run_demo(
                 #                              label='Diffusion guidance scale')
                 #     steps_slider2 = gr.Slider(5, 200, value=75, step=5,
                 #                              label='Number of diffusion inference steps')
+
+                gr.Markdown('*Set weights for multiview images:*')
+                cond_weight = gr.Slider(0, 10, value=1, step=1,
+                                        label='Condition weight of ref image')
+                cond_weight2 = gr.Slider(0, 10, value=1, step=1,
+                                         label='Condition weight of 2nd image')
+                multiview_steps = gr.Slider(5, 200, value=75, step=5,
+                                            label='Number of multiview diffusion inference steps')
 
                 with gr.Row():
                     vis_btn2 = gr.Button('Visualize Angles', variant='secondary')
@@ -977,10 +1214,41 @@ def run_demo(
                 vis_output2 = gr.Plot(
                     label='Relationship between input (green) and output (blue) camera poses')
 
-                gen_output2 = gr.Gallery(label='Generated images from specified new viewpoint')
+                gen_output2 = gr.Gallery(label='Generated images from multiple viewpoints')
                 gen_output2.style(grid=2)
 
                 preproc_output2 = gr.Image(type='pil', image_mode='RGB',
+                                          label='Preprocessed input image', visible=_SHOW_INTERMEDIATE)
+
+        # Multiview with TEXT
+        gr.Markdown("# MULTIVIEW with TEXT")
+        with gr.Row():
+            with gr.Column(scale=0.9, variant='panel'):
+
+                with gr.Row():
+                    text_prompt = gr.Textbox(placeholder="An anime doll")
+                    run_btn2t = gr.Button('Run Generation with SDtext', variant='primary')
+
+                text_weight = gr.Slider(0, 10, value=1, step=1,
+                                    label='Condition weight of text prompt')
+                text_steps = gr.Slider(5, 200, value=10, step=5,
+                                       label='Number of text diffusion inference steps')
+
+                # with gr.Accordion('Advanced options', open=False):
+                text_guidance_scale = gr.Slider(0, 30, value=9, step=1,
+                                    label='Text2Img Diffusion guidance scale')
+
+                desc_output2t = gr.Markdown('The results will appear on the right.', visible=_SHOW_DESC)
+
+            with gr.Column(scale=1.1, variant='panel'):
+
+                vis_output2t = gr.Plot(
+                    label='Relationship between input (green) and output (blue) camera poses')
+
+                gen_output2t = gr.Gallery(label='Generated images from multiple viewpoints, with TEXT')
+                gen_output2t.style(grid=2)
+
+                preproc_output2t = gr.Image(type='pil', image_mode='RGB',
                                           label='Preprocessed input image', visible=_SHOW_INTERMEDIATE)
 
         gr.Markdown(article)
@@ -991,6 +1259,7 @@ def run_demo(
 
         cam_vis = CameraVisualizer(vis_output)
         cam_vis2 = CameraVisualizer(vis_output2)
+        cam_vis2t = CameraVisualizer(vis_output2t)
 
         vis_btn.click(fn=partial(main_run, models, device, cam_vis, 'vis'),
                       inputs=[polar_slider, azimuth_slider, radius_slider,
@@ -1005,18 +1274,27 @@ def run_demo(
 
         vis_btn2.click(fn=partial(main_run_multiview, models, device, cam_vis2, 'vis'),
                       inputs=[polar_slider, azimuth_slider, radius_slider,
-                              image_block, preprocess_chk,
+                              image_block, preprocess_chk, cond_weight,
                               polar_slider2, azimuth_slider2, radius_slider2,
-                              image_block2, preprocess_chk2],
+                              image_block2, preprocess_chk2, cond_weight2],
                       outputs=[desc_output2, vis_output2, preproc_output2])
 
         run_btn2.click(fn=partial(main_run_multiview, models, device, cam_vis2, 'gen'),
                        inputs=[polar_slider, azimuth_slider, radius_slider,
-                               image_block, preprocess_chk,
+                               image_block, preprocess_chk, cond_weight,
                                polar_slider2, azimuth_slider2, radius_slider2,
-                               image_block2, preprocess_chk2,
+                               image_block2, preprocess_chk2, cond_weight2, multiview_steps,
                                scale_slider, samples_slider, steps_slider],
                       outputs=[desc_output2, vis_output2, preproc_output2, gen_output2])
+
+        run_btn2t.click(fn=partial(main_run_multiview, models, device, cam_vis2t, 'gen'),
+                       inputs=[polar_slider, azimuth_slider, radius_slider,
+                               image_block, preprocess_chk, cond_weight,
+                               polar_slider2, azimuth_slider2, radius_slider2,
+                               image_block2, preprocess_chk2, cond_weight2, multiview_steps,
+                               scale_slider, samples_slider, steps_slider,
+                               text_prompt, text_guidance_scale, text_weight, text_steps],
+                      outputs=[desc_output2t, vis_output2t, preproc_output2t, gen_output2t])
 
         # NEW:
         preset_inputs = [image_block, preprocess_chk,

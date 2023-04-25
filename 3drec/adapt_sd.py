@@ -34,7 +34,7 @@ def add_import_path(dirname):
     ))
 
 def load_model_from_config(config, ckpt, verbose=False):
-    from ldm.util import instantiate_from_config
+    from ldm_zero123.util import instantiate_from_config
     print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:

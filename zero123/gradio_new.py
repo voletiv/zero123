@@ -21,8 +21,8 @@ from contextlib import nullcontext
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from einops import rearrange
 from functools import partial
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.util import create_carvekit_interface, load_and_preprocess, instantiate_from_config
+from ldm_zero123.models.diffusion.ddim import DDIMSampler
+from ldm_zero123.util import create_carvekit_interface, load_and_preprocess, instantiate_from_config
 from lovely_numpy import lo
 from omegaconf import OmegaConf
 from PIL import Image

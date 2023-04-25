@@ -7,12 +7,12 @@ import gradio as gr
 import numpy as np
 import torch
 from einops import rearrange
-from ldm.models.diffusion.ddim import DDIMSampler
+from ldm_zero123.models.diffusion.ddim import DDIMSampler
 from omegaconf import OmegaConf
 from PIL import Image
 from torch import autocast
 from torchvision import transforms
-from ldm.util import load_and_preprocess, instantiate_from_config
+from ldm_zero123.util import load_and_preprocess, instantiate_from_config
 
 def load_model_from_config(config, ckpt, device, verbose=False):
     print(f"Loading model from {ckpt}")

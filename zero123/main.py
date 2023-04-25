@@ -18,8 +18,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateM
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
 
-from ldm.data.base import Txt2ImgIterableBaseDataset
-from ldm.util import instantiate_from_config
+from ldm_zero123.data.base import Txt2ImgIterableBaseDataset
+from ldm_zero123.util import instantiate_from_config
 
 MULTINODE_HACKS = False
 
@@ -696,7 +696,7 @@ if __name__ == "__main__":
                     "model.diffusion_model.input_blocks.0.0.weight",
                     "model_ema.diffusion_modelinput_blocks00weight",
                 ]
-                
+
                 for input_key in input_keys:
                     if input_key not in old_state or input_key not in new_state:
                         continue
